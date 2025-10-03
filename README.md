@@ -12,7 +12,7 @@ A tool to monitor disk health via SMART, compute a normalized **health %**, and 
   - One HA device per host
   - One sensor per drive for health %
   - One binary sensor per drive for SMART problem
-- Availability support (Last Will & Testament) so HA marks device offline if the script stops
+- Availability support (via heartbeat) so HA marks device offline if the script stops
 - Output modes: human-readable table, JSON, verbose breakdown
 
 ## Requirements
@@ -55,7 +55,6 @@ sudo apt-get install smartmontools
 - `--ha-discovery` : enable Home Assistant MQTT Discovery  
 - `--ha-prefix` : HA discovery prefix (default `homeassistant`)  
 - `--ha-node` : override HA device name  
-- `--ha-expire SEC` : optional expire_after for HA entities  
 - `--format {table,json}` : output style  
 - `--verbose` : for table, show penalty breakdown  
 - `--top N` : show top N penalties  
@@ -113,7 +112,6 @@ When `--ha-discovery` is enabled:
   - A binary sensor for SMART overall status
 - Entities use scalar topics above; JSON state is attached as attributes
 - Availability: entity status follows `<base-topic>/<hostname>/availability`
-- Optional `--ha-expire` makes entities unavailable if no update arrives in time
 
 ## Examples
 
