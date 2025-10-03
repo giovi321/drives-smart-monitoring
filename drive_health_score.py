@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # drive_health_score_v9.py
-# v9.2: smartctl non-zero exit handling, better POH selection,
-# Home Assistant MQTT Discovery, per-drive health% topics,
-# single HA "device" per host, LWT availability, and optional expire_after.
+# v9.3: remove --ha-expire, add MQTT heartbeat + HA heartbeat binary_sensor.
+# No other behavior changed.
 
 import argparse
 import json
@@ -19,7 +18,7 @@ try:
 except Exception:
     mqtt = None
 
-SCORING_VERSION = "v9.2"
+SCORING_VERSION = "v9.3"
 
 MAN = f"""\
 DRIVE_HEALTH_SCORE({SCORING_VERSION})                             User Commands                            DRIVE_HEALTH_SCORE({SCORING_VERSION})
@@ -45,7 +44,8 @@ DESCRIPTION
       • Human-readable table (with optional per-attribute breakdown) or JSON output (with optional verbose root summary)
       • MQTT output can be toggled off; with --no-mqtt, it runs one cycle and exits
       • Home Assistant MQTT Discovery: one HA device per host, one sensor per drive, plus a binary_sensor “problem”
-      • LWT availability and optional expire_after so sensors become “unavailable” if script stops
+      • LWT availability so HA marks device offline if the process dies
+      • Heartbeat topic and HA heartbeat binary_sensor to detect a stalled script without touching per-drive sensors
 
 INSTALLATION
     Requirements:
@@ -124,7 +124,11 @@ OPTIONS
       --ha-discovery         Enable Home Assistant MQTT Discovery (retained config)
       --ha-prefix PREFIX     Discovery prefix (default: homeassistant)
       --ha-node NAME         Override HA device name (default: <hostname>)
-      --ha-expire SEC        Set expire_after for entities; default = 2*interval+30
+
+    Heartbeat:
+      --heartbeat-sec N      Publish "alive" to <base-topic>/<host>/heartbeat every N seconds (default: 30, unretained)
+      --ha-heartbeat-expire S
+                             Heartbeat binary_sensor expire_after seconds (default: 2*N+5)
 
     Scheduling:
       --once                 Run once and exit (also implied by --no-mqtt)
@@ -145,14 +149,15 @@ OUTPUT
       <base-topic>/<host>/<drive>/health_percent   Number payload health% (retained)
       <base-topic>/<host>/<drive>/problem          "ON"/"OFF" SMART overall status (retained)
       <base-topic>/<host>/availability             "online"/"offline" (retained, LWT)
+      <base-topic>/<host>/heartbeat                "alive" (unretained, periodic)
 
     Home Assistant discovery (retained):
       <ha-prefix>/sensor/<uid>/config
-      <ha-prefix>/binary_sensor/<uid>/config
+      <ha-prefix>/binary_sensor/<uid>/config   (per-drive SMART problem + one host heartbeat)
 
 EXAMPLES
-    Run periodic with HA discovery:
-      drive_health_score.py --broker mqtt.local --interval 900 --retain --ha-discovery
+    Run periodic with HA discovery and heartbeat:
+      drive_health_score.py --broker mqtt.local --interval 900 --retain --ha-discovery --heartbeat-sec 30
 
 EXIT STATUS
     0  Success
@@ -160,7 +165,7 @@ EXIT STATUS
 
 NOTES
     • LWT is configured so entities flip to unavailable if the process dies or disconnects unexpectedly.
-    • Also sets expire_after for entities so they become unavailable if no updates arrive.
+    • Heartbeat binary_sensor becomes unavailable if heartbeats stop and expire_after elapses.
 
 SECURITY
     • If using MQTT over TLS, consider providing --cafile and avoid --insecure in production.
@@ -511,7 +516,6 @@ def make_client(args, host):
             client.tls_insecure_set(True)
 
     # Last Will: mark host offline if we disconnect unexpectedly
-    avail_topic = f"{args.base_topic}/{host}/availability"
     client.will_set(f"{args.base_topic}/{host}/availability", "offline", qos=args.qos, retain=True)
 
     client.connect(args.broker, args.port, keepalive=60)
@@ -528,13 +532,15 @@ def _slug(x):
         s = s.replace("__", "_")
     return s.strip("_").lower()
 
-def ha_discovery_publish(client, ha_prefix, base_topic, host, results, qos=0, retain=True, node_name=None, expire_after=None):
+def ha_discovery_publish(client, ha_prefix, base_topic, host, results, qos=0, retain=True, node_name=None,
+                         heartbeat_expire=None):
     """
     One HA device per host. One sensor and one binary_sensor per drive.
-    Unique IDs include drive serial when available to avoid collisions.
+    Plus a host heartbeat binary_sensor with expire_after.
     """
     node = node_name or host
     avail_topic = f"{base_topic}/{host}/availability"
+    hb_topic = f"{base_topic}/{host}/heartbeat"
 
     device_obj = {
         "identifiers": [f"smart_{host}"],
@@ -548,7 +554,6 @@ def ha_discovery_publish(client, ha_prefix, base_topic, host, results, qos=0, re
         devpath = r.get("device", "")
         serial = r.get("serial") or ""
         base = os.path.basename(devpath) or devpath or "drive"
-        # stable slug per drive on this host
         slug = _slug(f"{base}_{serial}") if serial else _slug(base)
 
         state_json_topic = f"{base_topic}/{host}/{slug}/state"
@@ -569,8 +574,6 @@ def ha_discovery_publish(client, ha_prefix, base_topic, host, results, qos=0, re
             "device": device_obj,
             "icon": "mdi:harddisk",
         }
-        if isinstance(expire_after, int) and expire_after > 0:
-            sensor_cfg["expire_after"] = int(expire_after)
         publish(client, sensor_cfg_topic, sensor_cfg, qos=qos, retain=retain)
 
         # binary_sensor: overall SMART problem
@@ -587,14 +590,32 @@ def ha_discovery_publish(client, ha_prefix, base_topic, host, results, qos=0, re
             "device": device_obj,
             "icon": "mdi:alert",
         }
-        if isinstance(expire_after, int) and expire_after > 0:
-            bin_cfg["expire_after"] = int(expire_after)
         publish(client, bin_cfg_topic, bin_cfg, qos=qos, retain=retain)
 
+    # Host heartbeat binary_sensor
+    hb_uid = _slug(f"{host}_heartbeat")
+    hb_cfg_topic = f"{ha_prefix}/binary_sensor/{hb_uid}/config"
+    hb_cfg = {
+        "name": f"{node} heartbeat",
+        "unique_id": hb_uid,
+        "state_topic": hb_topic,
+        "device_class": "connectivity",
+        "payload_on": "alive",
+        "availability_topic": avail_topic,
+        "device": device_obj,
+        "icon": "mdi:heart-pulse",
+    }
+    if isinstance(heartbeat_expire, int) and heartbeat_expire > 0:
+        hb_cfg["expire_after"] = int(heartbeat_expire)
+    publish(client, hb_cfg_topic, hb_cfg, qos=qos, retain=retain)
 
 
 def ha_publish_availability(client, base_topic, host, online=True, qos=0, retain=True):
     client.publish(f"{base_topic}/{host}/availability", "online" if online else "offline", qos=qos, retain=retain)
+
+def publish_heartbeat(client, base_topic, host, qos=0):
+    # unretained heartbeat so HA expire_after works
+    client.publish(f"{base_topic}/{host}/heartbeat", "alive", qos=qos, retain=False)
 
 
 # --------------------------- output -----------------------------------
@@ -763,7 +784,11 @@ def main():
     ap.add_argument("--ha-discovery", action="store_true", help="Enable Home Assistant MQTT Discovery")
     ap.add_argument("--ha-prefix", default="homeassistant", help="Home Assistant discovery prefix (default: homeassistant)")
     ap.add_argument("--ha-node", default=None, help="Override HA device name (default: <hostname>)")
-    ap.add_argument("--ha-expire", type=int, default=None, help="expire_after seconds for entities (optional)")
+
+    # Heartbeat
+    ap.add_argument("--heartbeat-sec", type=int, default=30, help="Publish heartbeat every N seconds (default: 30)")
+    ap.add_argument("--ha-heartbeat-expire", type=int, default=None,
+                    help="expire_after for heartbeat binary_sensor (default: 2*heartbeat+5)")
 
     # Scheduling
     ap.add_argument("--once", action="store_true", help="Run once and exit (also implied by --no-mqtt)")
@@ -784,7 +809,7 @@ def main():
     settings = {"ignore_samsung_181": bool(args.ignore_samsung_181)}
 
     host = socket.gethostname()
-    expire_after = args.ha_expire  # None means disabled
+    heartbeat_expire = args.ha_heartbeat_expire if args.ha_heartbeat_expire is not None else (2 * args.heartbeat_sec + 5)
 
     client = None
     if not args.no_mqtt:
@@ -838,11 +863,12 @@ def main():
                     qos=args.qos,
                     retain=True,
                     node_name=(args.ha_node or host),
-                    expire_after=expire_after,   # defined in main() above
+                    heartbeat_expire=heartbeat_expire,
                 )
             publish_all(client, args.base_topic, host, args.qos, args.retain, results, payload_root)
+            # initial heartbeat right after a scan
+            publish_heartbeat(client, args.base_topic, host, qos=args.qos)
             client.loop(timeout=1.0)
-
 
     # Single-run if --once OR --no-mqtt
     if args.once or args.no_mqtt:
@@ -858,16 +884,25 @@ def main():
                 pass
         return
 
-    # Periodic loop (MQTT mode)
+    # Periodic loop (MQTT mode) with heartbeat ticks
+    next_scan = 0.0
+    next_hb = 0.0
     while True:
+        now = time.time()
         try:
-            cycle()
+            if now >= next_scan:
+                cycle()
+                next_scan = now + max(10, args.interval)
+            if not args.no_mqtt and client is not None and now >= next_hb:
+                publish_heartbeat(client, args.base_topic, host, qos=args.qos)
+                client.loop(timeout=0.1)
+                next_hb = now + max(5, args.heartbeat_sec)
         except Exception as e:
             if not args.no_mqtt and client is not None:
                 publish(client, f"{args.base_topic}/{host}/error",
                         {"host": host, "error": str(e), "timestamp": int(time.time())}, qos=args.qos, retain=False)
             print(f"ERROR: {e}", file=sys.stderr)
-        time.sleep(args.interval)
+        time.sleep(1)
 
 
 if __name__ == "__main__":
