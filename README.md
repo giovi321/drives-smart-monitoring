@@ -134,8 +134,7 @@ Periodic with MQTT + HA discovery:
 Description=Drive SMART Health Monitoring
 
 [Service]
-ExecStart=/home/user/drives-smart-monitoring/venv/bin/python3   /home/user/drives-smart-monitoring/drive_health_score.py   --broker mqtt.local --retain --ha-discovery
-ExecStart=/home/user/drives-smart-monitoring/venv/bin/python3   /home/user/drives-smart-monitoring/drive_health_score.py \
+ExecStart=/home/user/drives-smart-monitoring/venv/bin/python3 /home/user/drives-smart-monitoring/drive_health_score.py \
 --broker 192.168.1.65 --port 1883 --username username --password password \
 --interval 43200 --ha-discovery --heartbeat-sec 30 --retain \
 --ignore-samsung-181 --ignore-nvme-used
