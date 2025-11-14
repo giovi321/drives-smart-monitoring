@@ -9,6 +9,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from math import log10
 
@@ -497,6 +498,80 @@ def compute_score(d, settings):
 
 
 # --------------------------- MQTT ------------------------------------
+class MQTTReconnectWorker:
+    def __init__(self, client, *, host, port, keepalive, max_backoff=300):
+        self.client = client
+        self._connect_kwargs = {"host": host, "port": port, "keepalive": keepalive}
+        self._max_backoff = max_backoff
+        self._backoff = 1.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._trigger = threading.Event()
+        self._scheduled = False
+        self._thread = threading.Thread(target=self._run, name="mqtt-reconnect", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._trigger.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def reset_backoff(self):
+        with self._lock:
+            self._backoff = 1.0
+
+    def schedule(self, *, reset_backoff=False):
+        with self._lock:
+            if reset_backoff:
+                self._backoff = 1.0
+            if self._scheduled or self._stop.is_set():
+                return
+            self._scheduled = True
+        self._trigger.set()
+
+    def _next_delay(self):
+        with self._lock:
+            delay = self._backoff
+            self._backoff = min(self._backoff * 2.0, float(self._max_backoff))
+            return delay
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._trigger.wait()
+            self._trigger.clear()
+            if self._stop.is_set():
+                break
+            while not self._stop.is_set():
+                try:
+                    rc = self.client.connect_async(**self._connect_kwargs)
+                except Exception:
+                    rc = mqtt.MQTT_ERR_NO_CONN if mqtt is not None else 1
+                if rc == mqtt.MQTT_ERR_SUCCESS:
+                    try:
+                        # Drive the network stack to kick off the handshake.
+                        self.client.loop(timeout=0.1)
+                    except Exception:
+                        pass
+                    break
+                delay = self._next_delay()
+                print(f"MQTT reconnect failed (rc={rc}); retrying in {int(delay)}s", file=sys.stderr)
+                time.sleep(delay)
+            with self._lock:
+                self._scheduled = False
+
+
+def _reason_code_value(code):
+    if code is None:
+        return None
+    if hasattr(code, "value"):
+        return code.value
+    try:
+        return int(code)
+    except Exception:
+        return None
+
+
 def make_client(args, host):
     if mqtt is None:
         raise RuntimeError("paho-mqtt not installed and MQTT requested. Use --no-mqtt or install paho-mqtt.")
@@ -524,8 +599,39 @@ def make_client(args, host):
     # Last Will: mark host offline if we disconnect unexpectedly
     client.will_set(f"{args.base_topic}/{host}/availability", "offline", qos=args.qos, retain=True)
 
-    client.connect(args.broker, args.port, keepalive=60)
-    return client
+    keepalive = 60
+    worker = MQTTReconnectWorker(client, host=args.broker, port=args.port, keepalive=keepalive)
+
+    state = {"worker": worker, "expected_disconnect": False}
+
+    def _on_connect(client, userdata, flags, reason_code, properties=None):
+        code = _reason_code_value(reason_code)
+        worker = userdata.get("worker") if isinstance(userdata, dict) else None
+        if code not in (None, mqtt.MQTT_ERR_SUCCESS, getattr(mqtt, "CONNACK_ACCEPTED", 0)):
+            print(f"MQTT connect failed (rc={code}); scheduling reconnect", file=sys.stderr)
+            if worker is not None:
+                worker.schedule()
+            return
+        if worker is not None:
+            worker.reset_backoff()
+
+    def _on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
+        if isinstance(userdata, dict) and userdata.get("expected_disconnect"):
+            return
+        code = _reason_code_value(reason_code)
+        if code in (None, mqtt.MQTT_ERR_SUCCESS):
+            return
+        print(f"MQTT disconnected unexpectedly (rc={code}); scheduling reconnect", file=sys.stderr)
+        worker = userdata.get("worker") if isinstance(userdata, dict) else None
+        if worker is not None:
+            worker.schedule(reset_backoff=False)
+
+    client.user_data_set(state)
+    client.on_connect = _on_connect
+    client.on_disconnect = _on_disconnect
+
+    client.connect(args.broker, args.port, keepalive=keepalive)
+    return client, worker, state
 
 
 def publish(client, topic, payload, qos=0, retain=False):
@@ -822,12 +928,14 @@ def main():
     heartbeat_expire = args.ha_heartbeat_expire if args.ha_heartbeat_expire is not None else (2 * args.heartbeat_sec + 5)
 
     client = None
+    reconnect_worker = None
+    mqtt_state = None
     if not args.no_mqtt:
         if mqtt is None:
             print("paho-mqtt not installed; proceeding with --no-mqtt", file=sys.stderr)
             args.no_mqtt = True
         else:
-            client = make_client(args, host)
+            client, reconnect_worker, mqtt_state = make_client(args, host)
             # Online for HA availability
             ha_publish_availability(client, args.base_topic, host, online=True, qos=args.qos, retain=True)
 
@@ -889,9 +997,13 @@ def main():
             except Exception:
                 pass
             try:
+                if mqtt_state is not None:
+                    mqtt_state["expected_disconnect"] = True
                 client.disconnect()
             except Exception:
                 pass
+            if reconnect_worker is not None:
+                reconnect_worker.stop()
         return
 
     # Periodic loop (MQTT mode) with heartbeat ticks
@@ -900,6 +1012,11 @@ def main():
     while True:
         now = time.time()
         try:
+            if not args.no_mqtt and client is not None:
+                try:
+                    client.loop(timeout=0.1)
+                except Exception:
+                    pass
             if now >= next_scan:
                 cycle()
                 next_scan = now + max(10, args.interval)
