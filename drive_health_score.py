@@ -543,10 +543,14 @@ class MQTTReconnectWorker:
             if self._stop.is_set():
                 break
             while not self._stop.is_set():
+                rc = None
                 try:
-                    rc = self.client.connect_async(**self._connect_kwargs)
+                    rc = self.client.reconnect()
                 except Exception:
-                    rc = mqtt.MQTT_ERR_NO_CONN if mqtt is not None else 1
+                    try:
+                        rc = self.client.connect(**self._connect_kwargs)
+                    except Exception:
+                        rc = mqtt.MQTT_ERR_NO_CONN if mqtt is not None else 1
                 if rc == mqtt.MQTT_ERR_SUCCESS:
                     try:
                         # Drive the network stack to kick off the handshake.
