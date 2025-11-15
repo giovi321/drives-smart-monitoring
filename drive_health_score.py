@@ -543,10 +543,14 @@ class MQTTReconnectWorker:
             if self._stop.is_set():
                 break
             while not self._stop.is_set():
+                rc = None
                 try:
-                    rc = self.client.connect_async(**self._connect_kwargs)
+                    rc = self.client.reconnect()
                 except Exception:
-                    rc = mqtt.MQTT_ERR_NO_CONN if mqtt is not None else 1
+                    try:
+                        rc = self.client.connect(**self._connect_kwargs)
+                    except Exception:
+                        rc = mqtt.MQTT_ERR_NO_CONN if mqtt is not None else 1
                 if rc == mqtt.MQTT_ERR_SUCCESS:
                     try:
                         # Drive the network stack to kick off the handshake.
@@ -602,7 +606,11 @@ def make_client(args, host):
     keepalive = 60
     worker = MQTTReconnectWorker(client, host=args.broker, port=args.port, keepalive=keepalive)
 
-    state = {"worker": worker, "expected_disconnect": False}
+    state = {
+        "worker": worker,
+        "expected_disconnect": False,
+        "force_cycle": threading.Event(),
+    }
 
     def _on_connect(client, userdata, flags, reason_code, properties=None):
         code = _reason_code_value(reason_code)
@@ -614,6 +622,14 @@ def make_client(args, host):
             return
         if worker is not None:
             worker.reset_backoff()
+        if isinstance(userdata, dict):
+            force = userdata.get("force_cycle")
+            if isinstance(force, threading.Event):
+                force.set()
+        try:
+            ha_publish_availability(client, args.base_topic, host, online=True, qos=args.qos, retain=True)
+        except Exception:
+            pass
 
     def _on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
         if isinstance(userdata, dict) and userdata.get("expected_disconnect"):
@@ -1012,6 +1028,13 @@ def main():
     while True:
         now = time.time()
         try:
+            force_cycle = None
+            if isinstance(mqtt_state, dict):
+                force_cycle = mqtt_state.get("force_cycle")
+            if isinstance(force_cycle, threading.Event) and force_cycle.is_set():
+                force_cycle.clear()
+                next_scan = 0.0
+                next_hb = 0.0
             if not args.no_mqtt and client is not None:
                 try:
                     client.loop(timeout=0.1)
