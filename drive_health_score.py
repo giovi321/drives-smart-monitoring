@@ -606,7 +606,11 @@ def make_client(args, host):
     keepalive = 60
     worker = MQTTReconnectWorker(client, host=args.broker, port=args.port, keepalive=keepalive)
 
-    state = {"worker": worker, "expected_disconnect": False}
+    state = {
+        "worker": worker,
+        "expected_disconnect": False,
+        "force_cycle": threading.Event(),
+    }
 
     def _on_connect(client, userdata, flags, reason_code, properties=None):
         code = _reason_code_value(reason_code)
@@ -618,6 +622,14 @@ def make_client(args, host):
             return
         if worker is not None:
             worker.reset_backoff()
+        if isinstance(userdata, dict):
+            force = userdata.get("force_cycle")
+            if isinstance(force, threading.Event):
+                force.set()
+        try:
+            ha_publish_availability(client, args.base_topic, host, online=True, qos=args.qos, retain=True)
+        except Exception:
+            pass
 
     def _on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
         if isinstance(userdata, dict) and userdata.get("expected_disconnect"):
@@ -1016,6 +1028,13 @@ def main():
     while True:
         now = time.time()
         try:
+            force_cycle = None
+            if isinstance(mqtt_state, dict):
+                force_cycle = mqtt_state.get("force_cycle")
+            if isinstance(force_cycle, threading.Event) and force_cycle.is_set():
+                force_cycle.clear()
+                next_scan = 0.0
+                next_hb = 0.0
             if not args.no_mqtt and client is not None:
                 try:
                     client.loop(timeout=0.1)
