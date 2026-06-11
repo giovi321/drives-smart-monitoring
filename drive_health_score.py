@@ -560,7 +560,9 @@ class MQTTReconnectWorker:
                     break
                 delay = self._next_delay()
                 print(f"MQTT reconnect failed (rc={rc}); retrying in {int(delay)}s", file=sys.stderr)
-                time.sleep(delay)
+                # Interruptible sleep so stop() is honored promptly during backoff.
+                if self._stop.wait(delay):
+                    break
             with self._lock:
                 self._scheduled = False
 
@@ -646,7 +648,18 @@ def make_client(args, host):
     client.on_connect = _on_connect
     client.on_disconnect = _on_disconnect
 
-    client.connect(args.broker, args.port, keepalive=keepalive)
+    # The initial connect must never be fatal. If the broker is unreachable at
+    # startup (e.g. service and broker come up together after a reboot, or the
+    # broker is briefly down), a synchronous connect() raises. Instead of letting
+    # that kill the process, hand off to the reconnect worker, which retries
+    # forever with backoff until the broker is reachable. connect_async() has
+    # already stored host/port/keepalive on the client, so worker reconnects work.
+    try:
+        client.connect(args.broker, args.port, keepalive=keepalive)
+    except Exception as e:
+        print(f"MQTT initial connect failed ({e}); retrying in background until broker is reachable",
+              file=sys.stderr)
+        worker.schedule(reset_backoff=True)
     return client, worker, state
 
 
