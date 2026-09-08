@@ -59,7 +59,9 @@ sudo apt-get install smartmontools
 - `--verbose` : for table, show penalty breakdown  
 - `--top N` : show top N penalties  
 - `--json-verbose` : include summary & settings in JSON root  
-- `--ignore-samsung-181` : skip SMART 181 penalty on Samsung SSDs  
+- `--ignore-nvme-used` : damp the NVMe endurance penalty to 40% of its weight  
+- `--ignore-samsung-181` : deprecated no-op, kept so existing unit files keep working  
+- `--prune-stale-topics` : one-time cleanup of drive slugs left by earlier versions  
 
 ## MQTT Topics & Payloads
 
@@ -68,8 +70,17 @@ For each drive:
 - JSON state:
 
 ```
-<base-topic>/<hostname>/<drive_slug>/state
+<base-topic>/<hostname>/<serial>/state
 ```
+
+The per-drive path segment is the drive serial. It is deliberately not the device name: Linux assigns
+`sd*` by discovery order, so a drive that moves from `sdc` to `sdi` would otherwise become a second
+sensor while the first froze at its last reading. WWN is used when a drive publishes no usable serial,
+and the kernel device name only as a last resort.
+
+Do not put the hostname in `--base-topic`. The program appends it, so `--base-topic servers/smart` on
+host `foo` publishes to `servers/smart/foo/...`. Copying a unit file between hosts without editing
+`--base-topic` makes the new host publish into the old one's tree.
 
 Example payload:
 
@@ -95,11 +106,18 @@ Example payload:
 - Scalar topics (retained):
 
 ```
-<base-topic>/<hostname>/<drive_slug>/health_percent   → e.g. "91.3"
-<base-topic>/<hostname>/<drive_slug>/problem          → "ON" / "OFF"
-<base-topic>/<hostname>/availability                  → "online" / "offline"
-<base-topic>/<hostname>/summary                       → JSON summary of all drives
+<base-topic>/<hostname>/<serial>/health_percent   → e.g. "91.3"
+<base-topic>/<hostname>/<serial>/problem          → "ON" / "OFF"
+<base-topic>/<hostname>/availability              → "online" / "offline"
+<base-topic>/<hostname>/summary                   → JSON summary of all drives
+<base-topic>/<hostname>/known_drives              → JSON list of serials published
 ```
+
+`known_drives` is bookkeeping. Because every drive topic is retained, a broker replays a removed
+drive's last reading forever, so a drive that has been pulled keeps a plausible health value and
+nothing looks wrong. Each run compares the current drives against this list and deletes the retained
+topics and discovery configs of any that have gone away. `availability` does not cover this: it is the
+publisher's last-will, so it only fires when the whole process dies, never when one drive disappears.
 
 ## Home Assistant Discovery
 
@@ -124,7 +142,7 @@ Run once, local output:
 Periodic with MQTT + HA discovery:
 
 ```bash
-./drive_health_score.py   --broker mqtt.local --port 1883   --retain --interval 900   --ha-discovery --ha-node hostA
+./drive_health_score.py   --broker mqtt.example.lan --port 1883   --retain --interval 900   --ha-discovery
 ```
 
 ## Systemd Service Example
@@ -132,18 +150,34 @@ Periodic with MQTT + HA discovery:
 ```ini
 [Unit]
 Description=Drive SMART Health Monitoring
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/home/user/drives-smart-monitoring/venv/bin/python3 /home/user/drives-smart-monitoring/drive_health_score.py \
 --broker mqtt.example.lan --port 1883 --username username --password password \
---interval 43200 --ha-discovery --heartbeat-sec 30 --retain \
---ignore-samsung-181 --ignore-nvme-used
+--base-topic servers/smart \
+--interval 43200 --ha-discovery --heartbeat-sec 30 --retain
 Restart=always
-RestartSec=10
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+Three things in that unit are deliberate:
+
+- `--base-topic` contains no hostname. The program appends the hostname itself, so the unit file can be
+  copied to another host unchanged. Put a hostname there, forget to edit it on the next host, and that
+  host publishes its own drives into the first host's topic tree.
+- `Wants=network-online.target` with `StartLimitIntervalSec=0` and a non-trivial `RestartSec`. Without
+  them, a boot where the network comes up after the service does will spend every retry inside systemd's
+  default 10-second start-limit window in about one second, after which systemd gives up permanently and
+  the host goes quiet. Because the health topics are retained, Home Assistant keeps showing the last
+  value, so a dead publisher looks exactly like a healthy one.
+- No `--ignore-*` flags. `--ignore-samsung-181` is a no-op now, and `--ignore-nvme-used` damps the one
+  signal that tells you a solid-state drive is running out of writes.
 
 Enable & start:
 
