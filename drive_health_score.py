@@ -1513,12 +1513,42 @@ def prune_vanished_drives(client, ha_prefix, base_topic, host, results, known_sl
     """
     current = {r.get("slug") for r in results if r.get("slug")}
     stale = sorted(sl for sl in known_slugs if sl and sl not in current)
+
+    # Deletions go out at QoS 1 and are waited on, unlike the state publishes.
+    #
+    # A retained message is deleted by publishing an empty payload to its topic, so a
+    # dropped delete leaves the stale topic alive and the phantom entity in Home
+    # Assistant. At the service's default --qos 0 that is fire-and-forget, and a prune
+    # of ten drives is fifty publishes queued immediately before the client
+    # disconnects: on 2026-09-09 a host pruning ten slugs had three deletes land and
+    # seven silently dropped. State publishes can afford QoS 0 because the next cycle
+    # repeats them; a delete happens exactly once and has no second chance.
+    infos = []
+    del_qos = max(1, int(qos or 0))
     for sl in stale:
         for t in drive_config_topics(ha_prefix, host, sl):
-            client.publish(t, "", qos=qos, retain=True)
+            infos.append(client.publish(t, "", qos=del_qos, retain=True))
         for t in drive_topics(base_topic, host, sl).values():
-            client.publish(t, "", qos=qos, retain=True)
+            infos.append(client.publish(t, "", qos=del_qos, retain=True))
         print(f"pruned vanished drive: {host}/{sl}", file=sys.stderr)
+
+    # Drive the network loop until the broker has acknowledged every delete. The caller
+    # may disconnect straight after (--once does), which would otherwise discard
+    # anything still sitting in the outbound queue.
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        pending = [i for i in infos if not i.is_published()]
+        if not pending:
+            break
+        try:
+            client.loop(timeout=0.2)
+        except Exception:
+            break
+    undelivered = sum(1 for i in infos if not i.is_published())
+    if undelivered:
+        print(f"WARNING: {undelivered} of {len(infos)} prune deletions unconfirmed; "
+              "stale topics may survive. Re-run with --prune-stale-topics.",
+              file=sys.stderr)
     return stale
 
 
