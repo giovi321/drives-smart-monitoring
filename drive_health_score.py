@@ -1236,10 +1236,23 @@ def ha_discovery_publish(client, ha_prefix, base_topic, host, results, qos=0, re
         health_topic     = topics["health_percent"]
         problem_topic    = topics["problem"]
 
-        # The entity name still carries the current device letter so the drive is easy
-        # to find in Home Assistant, but the letter is NOT part of the unique_id: a
-        # rename is harmless, a changed unique_id mints a whole new entity.
-        label = f"{devbase} {r.get('model') or ''}".strip() or slug
+        # The entity NAME is the serial, because Home Assistant derives the entity_id
+        # from the name and then never revises it.
+        #
+        # object_id, which exists precisely to pin the entity_id, is published below but
+        # is NOT honoured by Home Assistant 2026.8.1 for MQTT discovery: measured on
+        # 2026-09-09, a payload carrying object_id "hosta_<serial>_health" produced
+        # sensor.hosta_drives_smart_sda_st4000vn008_2dr166_health instead, built from the
+        # device name as renamed in the UI plus the friendly name. So the name is the
+        # only lever that actually controls the id, and a name containing the device
+        # letter bakes that letter into the id permanently.
+        #
+        # A model-based name is not sufficient either. Drives repeat: two ST4000DM004
+        # on one host, two ST12000NM0127 and two TS128GMTE110S on another, so
+        # "<letter> <model>" is unique only because of the letter. The serial is the one
+        # field that is unique, stable, and printed on the drive being pulled out.
+        # Device letter and model stay in the JSON attribute payload.
+        label = slug
 
         # sensor: health %
         sensor_uid = _slug(f"{host}_{slug}_health")
@@ -1247,22 +1260,10 @@ def ha_discovery_publish(client, ha_prefix, base_topic, host, results, qos=0, re
         sensor_cfg = {
             "name": f"{label} health",
             "unique_id": sensor_uid,
-            # object_id pins the Home Assistant entity_id instead of letting it be
-            # derived from the friendly name and the device name.
-            #
-            # Without it the entity_id is generated once, at first discovery, from
-            # "<device name> <entity name>" -- and then never revised. That produced two
-            # naming generations live side by side on one host, because the device had
-            # been renamed in the UI at some point: hostc_drives_smart_sdc_<serial>
-            # and hostc_sdc_<serial> both existed, from the same publisher, for the
-            # same drives. It also baked the device letter into the id permanently, so a
-            # drive that moved from sdc to sdi kept an entity_id naming a letter it no
-            # longer had.
-            #
-            # With object_id the id is a pure function of host and serial, so it is
-            # stable across letter changes, device renames and rediscovery. The friendly
-            # name below still carries the current device letter and model, where a
-            # value that changes is useful rather than misleading.
+            # object_id is published for the Home Assistant versions that honour it, but
+            # nothing here depends on it: 2026.8.1 ignores it for MQTT discovery and
+            # derives the entity_id from the device name plus the entity name instead.
+            # The serial-based name above is what actually makes the id stable.
             "object_id": sensor_uid,
             "state_topic": health_topic,
             "unit_of_measurement": "%",
